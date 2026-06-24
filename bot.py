@@ -111,8 +111,6 @@ def get_state(channel_id: int) -> dict:
     if channel_id not in channel_state:
         channel_state[channel_id] = {
             "last_reply": 0.0,
-            "pending_msgs": [],
-            "task": None,
         }
     return channel_state[channel_id]
 
@@ -173,18 +171,6 @@ async def reply_with_context(channel: discord.TextChannel, state: dict, trigger_
         print(f"[Send Error] {e}")
 
     state["last_reply"] = time.time()
-    state["pending_msgs"].clear()
-
-async def cooldown_then_reply(channel: discord.TextChannel, state: dict):
-    """等待冷卻結束後，若還有未回覆訊息就發言"""
-    remaining = COOLDOWN_SEC - (time.time() - state["last_reply"])
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-
-    if state["pending_msgs"]:
-        await reply_with_context(channel, state)
-
-    state["task"] = None
 
 @client.event
 async def on_ready():
@@ -210,24 +196,14 @@ async def on_message(message: discord.Message):
     is_mention = client.user in message.mentions
 
     if is_reply_to_bot or is_mention:
-        if state["task"] and not state["task"].done():
-            state["task"].cancel()
-            state["task"] = None
         await reply_with_context(channel, state, trigger_msg=message)
         return
 
-    state["pending_msgs"].append(message.content)
-
+    # 冷卻中則不回覆，等冷卻結束後的下一則新訊息才回
     now = time.time()
     elapsed = now - state["last_reply"]
 
     if elapsed >= COOLDOWN_SEC:
-        if state["task"] and not state["task"].done():
-            state["task"].cancel()
-        await reply_with_context(channel, state)
-        state["task"] = None
-    else:
-        if state["task"] is None or state["task"].done():
-            state["task"] = asyncio.create_task(cooldown_then_reply(channel, state))
+        await reply_with_context(channel, state, trigger_msg=message)
 
 client.run(DISCORD_TOKEN)
