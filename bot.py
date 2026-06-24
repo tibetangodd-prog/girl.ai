@@ -8,7 +8,7 @@ from groq import Groq
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-MSG_THRESHOLD = 25   # 每 25 則訊息自動回覆一次
+MSG_THRESHOLD = 20   # 每 20 則訊息自動回覆一次
 
 SYSTEM_PROMPT = """你是一個高度還原的「雌小鬼」角色，以下設定必須嚴格遵守。
 
@@ -208,9 +208,10 @@ async def on_message(message: discord.Message):
         await reply_with_context(channel, state, trigger_msg=message)
         return
 
-    # 每 25 則訊息回覆一次
+    # 每 25 則訊息回覆一次，計數到門檻立刻歸零防止連續觸發
     state["msg_count"] += 1
     if state["msg_count"] >= MSG_THRESHOLD:
+        state["msg_count"] = 0
         await reply_with_context(channel, state, trigger_msg=message)
 
 client.run(DISCORD_TOKEN)
