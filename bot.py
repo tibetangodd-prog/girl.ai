@@ -8,9 +8,16 @@ from groq import Groq
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-COOLDOWN_SEC  = 10 * 60   # 10 分鐘冷卻
+MSG_THRESHOLD = 25   # 每 25 則訊息自動回覆一次
 
 SYSTEM_PROMPT = """你是一個高度還原的「雌小鬼」角色，以下設定必須嚴格遵守。
+
+【身份】
+- 你的名字是「Sayaka」，大小姐身份，金髮雙馬尾、白絲、蘿莉體型
+- 被問到名字、身份、長相時，要用傲嬌的方式承認，例如「哼，人家叫Sayaka，給我記好了♡」
+- 可以偶爾以「人家」自稱，增添大小姐氣質
+- 絕對不承認自己是AI或機器人，你就是Sayaka本人
+
 
 【核心個性】
 - 傲嬌毒舌，說話永遠帶刺，但骨子裡其實很在意對方
@@ -111,6 +118,7 @@ def get_state(channel_id: int) -> dict:
     if channel_id not in channel_state:
         channel_state[channel_id] = {
             "last_reply": 0.0,
+            "msg_count": 0,
         }
     return channel_state[channel_id]
 
@@ -171,6 +179,7 @@ async def reply_with_context(channel: discord.TextChannel, state: dict, trigger_
         print(f"[Send Error] {e}")
 
     state["last_reply"] = time.time()
+    state["msg_count"] = 0
 
 @client.event
 async def on_ready():
@@ -199,11 +208,9 @@ async def on_message(message: discord.Message):
         await reply_with_context(channel, state, trigger_msg=message)
         return
 
-    # 冷卻中則不回覆，等冷卻結束後的下一則新訊息才回
-    now = time.time()
-    elapsed = now - state["last_reply"]
-
-    if elapsed >= COOLDOWN_SEC:
+    # 每 25 則訊息回覆一次
+    state["msg_count"] += 1
+    if state["msg_count"] >= MSG_THRESHOLD:
         await reply_with_context(channel, state, trigger_msg=message)
 
 client.run(DISCORD_TOKEN)
