@@ -10,7 +10,6 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 MSG_THRESHOLD = 20   # 每 20 則訊息自動回覆一次
-HISTORY_LIMIT = 8    # 上下文訊息數（含最新那則）
 
 SYSTEM_PROMPT = """你是一個高度還原的「雌小鬼」角色，以下設定必須嚴格遵守。
 
@@ -131,33 +130,21 @@ def is_media_only(message: discord.Message) -> bool:
 
 async def reply_with_context(channel: discord.TextChannel, state: dict, trigger_msg: discord.Message | None = None):
     try:
-        msgs = []
-        async for msg in channel.history(limit=HISTORY_LIMIT):
-            if msg.author.bot or is_media_only(msg) or not msg.content.strip():
-                continue
-            msgs.append(msg)
-        msgs.reverse()  # 時間正序
-
-        if not msgs:
-            return
-
-        # 最新一則當焦點，其餘當上下文
-        latest_msg = f"{msgs[-1].author.display_name}: {msgs[-1].content}"
-        history = [
-            {"role": "user", "content": f"{m.author.display_name}: {m.content}"}
-            for m in msgs[:-1]
-        ]
-    except Exception as e:
-        print(f"[History Error] {e}")
-        return
-
-    try:
         if trigger_msg:
             focused = f"{trigger_msg.author.display_name}: {trigger_msg.content}"
-            reply_text = ask_groq(history, focused)
+            reply_text = ask_groq([], focused)
             await trigger_msg.reply(reply_text, mention_author=False)
         else:
-            reply_text = ask_groq(history, latest_msg)
+            # 自動回覆：抓頻道最新一則訊息
+            latest = None
+            async for msg in channel.history(limit=10):
+                if msg.author.bot or is_media_only(msg) or not msg.content.strip():
+                    continue
+                latest = msg
+                break
+            if not latest:
+                return
+            reply_text = ask_groq([], f"{latest.author.display_name}: {latest.content}")
             await channel.send(reply_text)
     except Exception as e:
         print(f"[Send Error] {e}")
