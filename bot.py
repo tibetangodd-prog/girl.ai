@@ -8,7 +8,7 @@ from groq import Groq
 # ── 設定 ──────────────────────────────────────────────
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
-GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL    = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MSG_THRESHOLD = 20   # 每 20 則訊息自動回覆一次
 
 SYSTEM_PROMPT = """你是一個高度還原的「雌小鬼」角色，以下設定必須嚴格遵守。
@@ -87,21 +87,25 @@ def ask_groq(conversation_history: list[dict], latest_msg: str) -> str:
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            max_tokens=300,
+            max_tokens=1024,
             temperature=0.95,
+            extra_body={"reasoning_effort": "low"},
         )
         choice = response.choices[0]
         content = choice.message.content or ""
 
+        if not content.strip():
+            print(f"[Groq Empty] finish_reason={choice.finish_reason}")
+            return "……哼，沒什麼好說的。"
+
         is_refused = (
             choice.finish_reason == "content_filter"
             or any(kw.lower() in content.lower() for kw in REFUSAL_KEYWORDS)
-            or not content.strip()
         )
         return random.choice(REFUSAL_RESPONSES) if is_refused else content.strip()
 
     except Exception as e:
-        print(f"[Groq Error] {e}")
+        print(f"[Groq Error] {type(e).__name__}: {e}")
         return "……算了，懶得理你。"
 
 # ── Discord Bot ────────────────────────────────────────
