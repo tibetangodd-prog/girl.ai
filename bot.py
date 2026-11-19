@@ -3,7 +3,9 @@ import asyncio
 import os
 import time
 import random
+from discord import app_commands
 from groq import Groq
+from games import setup_games
 
 # ── 設定 ──────────────────────────────────────────────
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -113,6 +115,13 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# 斜線指令（小遊戲）
+tree = app_commands.CommandTree(client)
+setup_games(tree)
+# 選填：填入伺服器 ID（多個用逗號分隔）可讓指令即時生效；不填則同步為全域指令（可能要等一陣子）
+GUILD_IDS = [int(x) for x in os.getenv("GUILD_ID", "").split(",") if x.strip()]
+_synced = False
+
 channel_state: dict[int, dict] = {}
 
 def get_state(channel_id: int) -> dict:
@@ -158,7 +167,23 @@ async def reply_with_context(channel: discord.TextChannel, state: dict, trigger_
 
 @client.event
 async def on_ready():
+    global _synced
     print(f"[Bot] 已登入：{client.user} (id={client.user.id})")
+    if _synced:
+        return
+    _synced = True
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                guild = discord.Object(id=gid)
+                tree.copy_global_to(guild=guild)
+                await tree.sync(guild=guild)
+            print(f"[Bot] 已同步斜線指令到 {len(GUILD_IDS)} 個伺服器")
+        else:
+            await tree.sync()
+            print("[Bot] 已同步全域斜線指令")
+    except Exception as e:
+        print(f"[Sync Error] {type(e).__name__}: {e}")
 
 @client.event
 async def on_message(message: discord.Message):
