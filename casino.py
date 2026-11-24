@@ -25,6 +25,10 @@ from games import (
     add_balance,
     fmt_cards,
     get_balance,
+    net_text,
+    outcome_color,
+    record_result,
+    reject,
     respond,
     try_deduct,
     validate_bet,
@@ -37,22 +41,6 @@ async def pause(seconds: float) -> None:
 
 
 # ── 共用工具 ──────────────────────────────────────────
-def net_text(net: int) -> str:
-    if net > 0:
-        return f"+{net:,}"
-    if net < 0:
-        return f"-{-net:,}"
-    return "±0"
-
-
-def outcome_color(net: int) -> discord.Color:
-    if net > 0:
-        return discord.Color.green()
-    if net < 0:
-        return discord.Color.red()
-    return discord.Color.light_grey()
-
-
 def settle_embed(title: str, detail: str, bet: int, payout: int, gid: int, uid: int) -> discord.Embed:
     """payout 是「拿回的總額」（含本金），已經加進餘額之後才呼叫。"""
     net = payout - bet
@@ -64,10 +52,6 @@ def settle_embed(title: str, detail: str, bet: int, payout: int, gid: int, uid: 
     )
     e.set_footer(text=f"下注 {bet:,}｜餘額 {get_balance(gid, uid):,} {CURRENCY}")
     return e
-
-
-async def reject(interaction: discord.Interaction, msg: str) -> None:
-    await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def safe_edit(interaction: discord.Interaction, **kw) -> None:
@@ -302,11 +286,13 @@ class HiLoView(discord.ui.View):
         e.set_footer(text=f"本金 {self.bet:,}｜按鈕上的倍率會乘在目前獎金上")
         return e
 
-    def finish(self, payout: int, headline: str, note: str = "") -> discord.Embed:
+    def finish(self, payout: int, headline: str, note: str = "", record: bool = True) -> discord.Embed:
         self.finished = True
         ACTIVE_HILO.discard((self.gid, self.uid))
         if payout:
             add_balance(self.gid, self.uid, payout)
+        if record:
+            record_result(self.gid, self.uid, "hilo", self.bet, payout)
         for child in self.children:
             child.disabled = True
         self.stop()
@@ -322,7 +308,7 @@ class HiLoView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.uid:
-            await interaction.response.send_message("這不是你的牌局，雜魚別亂按！", ephemeral=True)
+            await reject(interaction, "這不是你的牌局，雜魚別亂按！")
             return False
         return True
 
@@ -331,7 +317,7 @@ class HiLoView(discord.ui.View):
             return await interaction.response.defer()
         mult = hilo_mult(self.rank, higher)
         if mult is None:
-            return await interaction.response.send_message("那個方向不可能贏啦，笨蛋！", ephemeral=True)
+            return await reject(interaction, "那個方向不可能贏啦，笨蛋！")
         nxt = random.randint(1, 13)
         suit = random.choice(SUITS)
         win = nxt > self.rank if higher else nxt < self.rank
@@ -363,7 +349,7 @@ class HiLoView(discord.ui.View):
     async def on_timeout(self):
         if self.finished:
             return
-        embed = self.finish(self.pot, "⏰ 思考太久，自動收手", note="⏰ 超時自動收手")
+        embed = self.finish(self.pot, "⏰ 思考太久，自動收手", note="⏰ 超時自動收手", record=self.streak > 0)
         if self.message:
             try:
                 await self.message.edit(embed=embed, view=self.replay_view())
@@ -480,17 +466,17 @@ class DuelView(discord.ui.View):
         if self.finished:
             return await interaction.response.defer()
         if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message("這不是給你的決鬥，旁邊看戲就好，雜魚！", ephemeral=True)
+            return await reject(interaction, "這不是給你的決鬥，旁邊看戲就好，雜魚！")
         if not try_deduct(self.gid, self.opponent.id, self.bet):
-            return await interaction.response.send_message(
-                f"你的錢不夠 {self.bet:,} {CURRENCY}……", ephemeral=True
-            )
+            return await reject(interaction, f"你的錢不夠 {self.bet:,} {CURRENCY}……")
         self._close()
         a = b = 0
         while a == b:
             a, b = random.randint(1, 100), random.randint(1, 100)
         winner, loser = (self.challenger, self.opponent) if a > b else (self.opponent, self.challenger)
         add_balance(self.gid, winner.id, self.bet * 2)
+        record_result(self.gid, winner.id, "duel", self.bet, self.bet * 2)
+        record_result(self.gid, loser.id, "duel", self.bet, 0)
         embed = discord.Embed(
             title="⚔️ 決鬥結果",
             description=(
@@ -508,7 +494,7 @@ class DuelView(discord.ui.View):
         if self.finished:
             return await interaction.response.defer()
         if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message("這不是給你的決鬥。", ephemeral=True)
+            return await reject(interaction, "這不是給你的決鬥。")
         self._refund()
         self._close()
         await interaction.response.edit_message(
@@ -526,7 +512,7 @@ class DuelView(discord.ui.View):
         if self.finished:
             return await interaction.response.defer()
         if interaction.user.id != self.challenger.id:
-            return await interaction.response.send_message("只有發起的人能取消。", ephemeral=True)
+            return await reject(interaction, "只有發起的人能取消。")
         self._refund()
         self._close()
         await interaction.response.edit_message(
@@ -576,6 +562,7 @@ async def play_slots(interaction: discord.Interaction, bet: int) -> bool:
     payout, label = slot_payout(reels, bet)
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "slots", bet, payout)
     final = settle_embed("🎰 老虎機", f"**｜ {' ｜ '.join(reels)} ｜**\n{label}", bet, payout, gid, uid)
 
     await respond(interaction, embed=slot_frame(reels, 0))
@@ -604,6 +591,7 @@ async def play_roulette(
     payout = roulette_payout(kind.value, spin, bet, number)
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "roulette", bet, payout)
     pick = f"單一號碼 {number}" if kind.value == "num" else ROULETTE_BETS[kind.value][0]
     final = settle_embed(
         "🎡 輪盤",
@@ -633,6 +621,7 @@ async def play_baccarat(interaction: discord.Interaction, bet: int, side: app_co
     payout = baccarat_payout(side.value, result, bet)
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "baccarat", bet, payout)
     detail = (
         f"閒家 {fmt_cards(player)}（**{bac_total(player)}** 點）\n"
         f"莊家 {fmt_cards(banker)}（**{bac_total(banker)}** 點）\n"
@@ -660,6 +649,7 @@ async def play_sicbo(
     payout = sicbo_payout(kind.value, dice, bet, number)
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "sicbo", bet, payout)
     faces = " ".join(DICE_FACES[d - 1] for d in dice)
     pick = f"指定點數 {number}" if kind.value == "single" else SICBO_NAMES[kind.value]
     triple_note = "　**（圍骰！）**" if dice[0] == dice[1] == dice[2] else ""
@@ -701,6 +691,7 @@ async def play_race(interaction: discord.Interaction, bet: int, horse: app_comma
     payout = int(bet * horse_mult(pick)) if winner == pick else 0
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "race", bet, payout)
     frames = simulate_race(winner)
     final = settle_embed(
         "🏇 賽馬",
@@ -735,6 +726,7 @@ async def play_scratch(interaction: discord.Interaction, bet: int) -> bool:
     payout = bet * mult
     if payout:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "scratch", bet, payout)
     net = payout - bet
     bal = get_balance(gid, uid)
     cells = build_grid(sym)
@@ -877,5 +869,6 @@ def setup_casino(tree: app_commands.CommandTree) -> None:
         e.add_field(name="🏇 `/賽馬`", value="五匹馬，賠率 ×2.7 ~ ×11.9（約 95%）", inline=False)
         e.add_field(name="🎟️ `/刮刮樂`", value="九格湊三個相同，最高 ×200（約 93.5%）", inline=False)
         e.add_field(name="⚔️ `/決鬥`", value="玩家對玩家，雙方各出賭注，點數大的全拿", inline=False)
+        e.add_field(name="📊 `/戰績`", value="查看自己或其他玩家每個遊戲的局數、勝率、總盈虧", inline=False)
         e.set_footer(text=f"最低下注 10 {CURRENCY}｜括號內是長期平均每 100 塊會拿回多少")
         await interaction.response.send_message(embed=e)

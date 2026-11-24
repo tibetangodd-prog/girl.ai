@@ -57,6 +57,21 @@ _db.execute(
 # 舊版資料庫沒有 last_hourly 欄位，補上（不會動到現有資料）
 if "last_hourly" not in [r[1] for r in _db.execute("PRAGMA table_info(users)")]:
     _db.execute("ALTER TABLE users ADD COLUMN last_hourly REAL NOT NULL DEFAULT 0")
+# 戰績：每個「伺服器 × 玩家 × 遊戲」一列
+_db.execute(
+    """CREATE TABLE IF NOT EXISTS stats (
+        guild_id INTEGER NOT NULL,
+        user_id  INTEGER NOT NULL,
+        game     TEXT    NOT NULL,
+        rounds   INTEGER NOT NULL DEFAULT 0,
+        wins     INTEGER NOT NULL DEFAULT 0,
+        losses   INTEGER NOT NULL DEFAULT 0,
+        pushes   INTEGER NOT NULL DEFAULT 0,
+        wagered  INTEGER NOT NULL DEFAULT 0,
+        net      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id, game)
+    )"""
+)
 _db.commit()
 
 
@@ -120,6 +135,126 @@ def claim(gid: int, uid: int, column: str, cooldown: int, reward: int):
     return True, int(now + cooldown)
 
 
+# ── 戰績 ──────────────────────────────────────────────
+# 顯示順序與名稱（key 是存進資料庫的代號）
+GAME_INFO = {
+    "coin": ("🪙", "猜硬幣"),
+    "dice": ("🎲", "擲骰"),
+    "blackjack": ("🃏", "21點"),
+    "slots": ("🎰", "老虎機"),
+    "roulette": ("🎡", "輪盤"),
+    "baccarat": ("🎴", "百家樂"),
+    "sicbo": ("🎯", "骰寶"),
+    "hilo": ("♠️", "高低牌"),
+    "race": ("🏇", "賽馬"),
+    "scratch": ("🎟️", "刮刮樂"),
+    "duel": ("⚔️", "決鬥"),
+}
+
+
+def record_result(gid: int, uid: int, game: str, bet: int, payout: int) -> None:
+    """記錄一局結果。payout 是「拿回的總額」（含本金；輸光就是 0）。
+    盈虧 = payout - bet：大於 0 算贏、小於 0 算輸、等於 0 算平手（含回本、退回本金）。
+    每一局只能在結算時呼叫一次。"""
+    net = payout - bet
+    _db.execute(
+        "INSERT OR IGNORE INTO stats (guild_id, user_id, game) VALUES (?, ?, ?)", (gid, uid, game)
+    )
+    _db.execute(
+        """UPDATE stats SET rounds = rounds + 1, wins = wins + ?, losses = losses + ?,
+               pushes = pushes + ?, wagered = wagered + ?, net = net + ?
+           WHERE guild_id=? AND user_id=? AND game=?""",
+        (1 if net > 0 else 0, 1 if net < 0 else 0, 1 if net == 0 else 0, bet, net, gid, uid, game),
+    )
+    _db.commit()
+
+
+def get_stats(gid: int, uid: int) -> dict:
+    """回傳 {遊戲代號: {rounds, wins, losses, pushes, wagered, net}}，沒玩過的遊戲不會出現"""
+    rows = _db.execute(
+        "SELECT game, rounds, wins, losses, pushes, wagered, net FROM stats WHERE guild_id=? AND user_id=?",
+        (gid, uid),
+    ).fetchall()
+    keys = ("rounds", "wins", "losses", "pushes", "wagered", "net")
+    return {r[0]: dict(zip(keys, r[1:])) for r in rows}
+
+
+def win_rate(wins: int, rounds: int) -> str:
+    return f"{wins / rounds * 100:.1f}%" if rounds else "—"
+
+
+# ── 框框（embed）共用工具 ──────────────────────────────
+def net_text(net: int) -> str:
+    if net > 0:
+        return f"+{net:,}"
+    if net < 0:
+        return f"-{-net:,}"
+    return "±0"
+
+
+def outcome_color(net: int) -> discord.Color:
+    if net > 0:
+        return discord.Color.green()
+    if net < 0:
+        return discord.Color.red()
+    return discord.Color.light_grey()
+
+
+def avatar_url(member) -> Optional[str]:
+    return getattr(getattr(member, "display_avatar", None), "url", None)
+
+
+def error_embed(msg: str, title: str = "⚠️ 不行哦") -> discord.Embed:
+    return discord.Embed(title=title, description=msg, color=discord.Color.orange())
+
+
+async def reject(interaction: discord.Interaction, msg: str, title: str = "⚠️ 不行哦") -> None:
+    """只有本人看得到的錯誤框框"""
+    await interaction.response.send_message(embed=error_embed(msg, title), ephemeral=True)
+
+
+def build_stats_embed(gid: int, member) -> discord.Embed:
+    name = member.display_name
+    stats = get_stats(gid, member.id)
+    url = avatar_url(member)
+    if not stats:
+        e = discord.Embed(
+            title=f"📊 {name} 的戰績",
+            description="還沒有任何賭博紀錄，連一把都不敢賭嗎，雜魚♡",
+            color=discord.Color.light_grey(),
+        )
+        if url:
+            e.set_thumbnail(url=url)
+        return e
+
+    total = {k: sum(row[k] for row in stats.values()) for k in ("rounds", "wins", "losses", "pushes", "wagered", "net")}
+    e = discord.Embed(title=f"📊 {name} 的戰績", color=outcome_color(total["net"]))
+    e.description = (
+        f"**總局數**　{total['rounds']:,} 局\n"
+        f"**勝率**　{win_rate(total['wins'], total['rounds'])}（{total['wins']:,} 勝 {total['losses']:,} 敗 {total['pushes']:,} 平）\n"
+        f"**總盈虧**　{'📈' if total['net'] > 0 else '📉' if total['net'] < 0 else '➖'} **{net_text(total['net'])}** {CURRENCY}\n"
+        f"**總下注**　{total['wagered']:,} {CURRENCY}\n"
+        f"**目前餘額**　{get_balance(gid, member.id):,} {CURRENCY}"
+    )
+    for key, (emoji, title) in GAME_INFO.items():
+        row = stats.get(key)
+        if not row:
+            continue
+        e.add_field(
+            name=f"{emoji} {title}",
+            value=(
+                f"{row['rounds']:,} 局｜勝率 {win_rate(row['wins'], row['rounds'])}\n"
+                f"{row['wins']:,} 勝 {row['losses']:,} 敗 {row['pushes']:,} 平\n"
+                f"盈虧 **{net_text(row['net'])}**"
+            ),
+            inline=True,
+        )
+    if url:
+        e.set_thumbnail(url=url)
+    e.set_footer(text="勝率＝贏的局數 ÷ 總局數（平手、回本不算贏也不算輸）｜戰績從這個功能上線後開始累計")
+    return e
+
+
 async def respond(interaction: discord.Interaction, *, embed: discord.Embed, view=None) -> None:
     """遊戲的第一次回應。
     斜線指令 → 送出新訊息；按鈕（再來一把）→ 就地更新原訊息，並換掉舊按鈕。
@@ -150,7 +285,7 @@ class ReplayView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.uid:
-            await interaction.response.send_message("這不是你的牌局，想玩就自己開一局啦，雜魚！", ephemeral=True)
+            await reject(interaction, "這不是你的牌局，想玩就自己開一局啦，雜魚！")
             return False
         return True
 
@@ -292,6 +427,7 @@ class BlackjackView(discord.ui.View):
 
         if payout:
             add_balance(self.gid, self.uid, payout)
+        record_result(self.gid, self.uid, "blackjack", self.bet, payout)
         profit = payout - self.bet
         bal = get_balance(self.gid, self.uid)
 
@@ -322,7 +458,7 @@ class BlackjackView(discord.ui.View):
     # 只有開局的人能按 -------------------------------------------------
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.uid:
-            await interaction.response.send_message("這不是你的牌局，雜魚別亂按！", ephemeral=True)
+            await reject(interaction, "這不是你的牌局，雜魚別亂按！")
             return False
         return True
 
@@ -374,7 +510,7 @@ async def play_dice(interaction: discord.Interaction, bet: int, guess: app_comma
     gid, uid = interaction.guild_id, interaction.user.id
     err = validate_bet(gid, uid, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await reject(interaction, err)
         return False
     try_deduct(gid, uid, bet)
 
@@ -388,6 +524,7 @@ async def play_dice(interaction: discord.Interaction, bet: int, guess: app_comma
         won, payout = roll == int(g), bet * 6
     if won:
         add_balance(gid, uid, payout)
+    record_result(gid, uid, "dice", bet, payout if won else 0)
 
     bal = get_balance(gid, uid)
     if won:
@@ -411,7 +548,7 @@ async def play_coin(interaction: discord.Interaction, bet: int, side: app_comman
     gid, uid = interaction.guild_id, interaction.user.id
     err = validate_bet(gid, uid, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await reject(interaction, err)
         return False
     try_deduct(gid, uid, bet)
 
@@ -420,6 +557,7 @@ async def play_coin(interaction: discord.Interaction, bet: int, side: app_comman
     won = result == side.value
     if won:
         add_balance(gid, uid, bet * 2)
+    record_result(gid, uid, "coin", bet, bet * 2 if won else 0)
     bal = get_balance(gid, uid)
 
     if won:
@@ -442,11 +580,11 @@ async def play_coin(interaction: discord.Interaction, bet: int, side: app_comman
 async def start_blackjack(interaction: discord.Interaction, bet: int) -> bool:
     gid, uid = interaction.guild_id, interaction.user.id
     if (gid, uid) in ACTIVE:
-        await interaction.response.send_message("你還有一局沒打完呢，笨蛋！", ephemeral=True)
+        await reject(interaction, "你還有一局沒打完呢，笨蛋！")
         return False
     err = validate_bet(gid, uid, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await reject(interaction, err)
         return False
     try_deduct(gid, uid, bet)
     ACTIVE.add((gid, uid))
@@ -469,7 +607,15 @@ def setup_games(tree: app_commands.CommandTree) -> None:
     async def balance_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
         target = user or interaction.user
         bal = get_balance(interaction.guild_id, target.id)
-        await interaction.response.send_message(f"💰 {target.display_name} 有 **{bal:,}** {CURRENCY}")
+        embed = discord.Embed(
+            title=f"💰 {target.display_name} 的錢包",
+            description=f"**{bal:,}** {CURRENCY}",
+            color=discord.Color.gold(),
+        )
+        url = avatar_url(target)
+        if url:
+            embed.set_thumbnail(url=url)
+        await interaction.response.send_message(embed=embed)
 
     @tree.command(name="每日", description=f"每天領取 {DAILY_REWARD:,} {CURRENCY}")
     @app_commands.guild_only()
@@ -477,14 +623,15 @@ def setup_games(tree: app_commands.CommandTree) -> None:
         gid, uid = interaction.guild_id, interaction.user.id
         ok, ts = claim(gid, uid, "last_daily", DAILY_COOLDOWN, DAILY_REWARD)
         if not ok:
-            await interaction.response.send_message(
-                f"哼，今天的已經領過了，貪心的雜魚♡ 下次可以領：<t:{ts}:R>", ephemeral=True
-            )
+            await reject(interaction, f"哼，今天的已經領過了，貪心的雜魚♡\n下次可以領：<t:{ts}:R>", title="⏰ 還不能領")
             return
         bal = get_balance(gid, uid)
-        await interaction.response.send_message(
-            f"哼，這是今天的零用錢，才不是特地給你的呢♡\n+{DAILY_REWARD:,} {CURRENCY}，目前 **{bal:,}**"
+        embed = discord.Embed(
+            title="🎁 每日簽到",
+            description=f"哼，這是今天的零用錢，才不是特地給你的呢♡\n\n**+{DAILY_REWARD:,}** {CURRENCY}\n目前餘額 **{bal:,}** {CURRENCY}",
+            color=discord.Color.green(),
         )
+        await interaction.response.send_message(embed=embed)
 
     @tree.command(name="每小時", description=f"每小時領取 {HOURLY_REWARD:,} {CURRENCY}")
     @app_commands.guild_only()
@@ -492,14 +639,15 @@ def setup_games(tree: app_commands.CommandTree) -> None:
         gid, uid = interaction.guild_id, interaction.user.id
         ok, ts = claim(gid, uid, "last_hourly", HOURLY_COOLDOWN, HOURLY_REWARD)
         if not ok:
-            await interaction.response.send_message(
-                f"才過沒多久吧，急什麼啦雜魚♡ 下次可以領：<t:{ts}:R>", ephemeral=True
-            )
+            await reject(interaction, f"才過沒多久吧，急什麼啦雜魚♡\n下次可以領：<t:{ts}:R>", title="⏰ 還不能領")
             return
         bal = get_balance(gid, uid)
-        await interaction.response.send_message(
-            f"哼，小費給你，拿去賭吧♡\n+{HOURLY_REWARD:,} {CURRENCY}，目前 **{bal:,}**"
+        embed = discord.Embed(
+            title="⏱️ 每小時簽到",
+            description=f"哼，小費給你，拿去賭吧♡\n\n**+{HOURLY_REWARD:,}** {CURRENCY}\n目前餘額 **{bal:,}** {CURRENCY}",
+            color=discord.Color.green(),
         )
+        await interaction.response.send_message(embed=embed)
 
     @tree.command(name="排行榜", description="這個伺服器的金幣排行榜")
     @app_commands.guild_only()
@@ -509,7 +657,11 @@ def setup_games(tree: app_commands.CommandTree) -> None:
             (interaction.guild_id,),
         ).fetchall()
         if not rows:
-            await interaction.response.send_message("還沒有人玩過呢，一群雜魚。")
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="🏆 金幣排行榜", description="還沒有人玩過呢，一群雜魚。", color=discord.Color.gold()
+                )
+            )
             return
         medals = ["🥇", "🥈", "🥉"]
         lines = []
@@ -518,6 +670,17 @@ def setup_games(tree: app_commands.CommandTree) -> None:
             lines.append(f"{rank} <@{uid}>　{bal:,} {CURRENCY}")
         embed = discord.Embed(title="🏆 金幣排行榜", description="\n".join(lines), color=discord.Color.gold())
         await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="戰績", description="查看玩家的賭博戰績：各遊戲局數、勝率、總盈虧")
+    @app_commands.guild_only()
+    @app_commands.describe(user="要查詢的玩家（預設是你自己）")
+    @app_commands.rename(user="玩家")
+    async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+        target = user or interaction.user
+        if target.bot:
+            await reject(interaction, "機器人才不賭博呢，笨蛋！")
+            return
+        await interaction.response.send_message(embed=build_stats_embed(interaction.guild_id, target))
 
     @tree.command(name="擲骰", description="賭骰子：猜點數賠 5 倍，猜大小賠 1 倍")
     @app_commands.guild_only()
@@ -555,10 +718,10 @@ def setup_games(tree: app_commands.CommandTree) -> None:
     ):
         # default_permissions 只是預設隱藏，伺服器管理員可以在「整合」裡改掉，所以執行時一定要再檢查一次
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("哼，只有管理員才能用這個指令，雜魚♡", ephemeral=True)
+            await reject(interaction, "哼，只有管理員才能用這個指令，雜魚♡")
             return
         if member.bot:
-            await interaction.response.send_message("機器人要錢幹嘛啦，笨蛋！", ephemeral=True)
+            await reject(interaction, "機器人要錢幹嘛啦，笨蛋！")
             return
         new_bal = add_balance(interaction.guild_id, member.id, amount)
         print(f"[Admin] guild={interaction.guild_id} {interaction.user} ({interaction.user.id}) "
